@@ -129,6 +129,8 @@ def fmt_dt_fa(iso_str):
         dt = datetime.fromisoformat(s)
     except (ValueError, TypeError):
         return esc(iso_str)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()  # به منطقه‌ی زمانی همین کامپیوتر (قبلاً UTC نشون داده میشد و با شمارش معکوس نمی‌خوند)
     weekday = WEEKDAYS_FA[dt.weekday()]
     month = MONTHS_FA[dt.month - 1]
     return f"{weekday} {dt.day} {month}، ساعت {dt.strftime('%H:%M')}"
@@ -1603,6 +1605,11 @@ def render_dashboard(db):
 ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}  # جلوگیری از DNS rebinding
 ALLOWED_ORIGINS = {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
 MAX_BODY_BYTES = 50 * 1024 * 1024
+
+# بعد از بستن سرور، پورت تا حدود یک دقیقه توی حالت TIME_WAIT می‌مونه و اجرای دوباره با
+# "Address already in use" می‌ترکید. روی لینوکس/مک SO_REUSEADDR این رو حل می‌کنه. روی ویندوز نه:
+# اونجا SO_REUSEADDR اجازه میده یه پروسه‌ی دیگه هم روی همون پورت گوش بده.
+socketserver.TCPServer.allow_reuse_address = os.name != "nt"
 
 
 def origin_allowed(origin):
