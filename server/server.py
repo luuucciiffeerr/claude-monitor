@@ -23,14 +23,42 @@ def load_db():
         return {}
     with open(DB_PATH, "r", encoding="utf-8") as f:
         try:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
         except json.JSONDecodeError:
-            return {}
+            pass
+    # فایل خراب بود. قبل از این‌که save_db بعدی روش بنویسه، یه کپی نگه می‌داریم
+    # (قبلاً بی‌صدا {} برمی‌گشت و کل تاریخچه با اولین گزارش بعدی از بین می‌رفت).
+    try:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        os.replace(DB_PATH, f"{DB_PATH}.corrupt-{stamp}")
+    except OSError:
+        pass
+    return {}
 
 
 def save_db(db):
-    with open(DB_PATH, "w", encoding="utf-8") as f:
+    # اول توی فایل موقت می‌نویسیم و بعد جابه‌جا می‌کنیم، تا قطع برق/کرش وسط نوشتن فایل رو نصفه نذاره.
+    tmp = DB_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DB_PATH)
+
+
+USAGE_NUMBER_KEYS = ("sessionUtilization", "sessionResetsAt", "weeklyUtilization", "weeklyResetsAt")
+
+
+def merge_usage(old, new):
+    """گزارشی که عدد مصرف نداره (مثلاً تبی که هنوز چیزی از استریم نگرفته) نباید
+    عددهای خوبِ قبلی رو پاک کنه. فقط مقدارهایی که واقعاً رسیدن جایگزین میشن."""
+    if not isinstance(new, dict):
+        return old
+    merged = dict(old) if isinstance(old, dict) else {}
+    for k, v in new.items():
+        if k in USAGE_NUMBER_KEYS and v is None:
+            continue
+        merged[k] = v
+    return merged
 
 
 def esc(s):
@@ -1582,16 +1610,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             account = db.setdefault(label, {"usage": None, "usageDebug": None, "chats": {}})
 
             if payload.get("usage"):
-                account["usage"] = payload["usage"]
+                account["usage"] = merge_usage(account.get("usage"), payload["usage"])
             if payload.get("usageDebug"):
                 account["usageDebug"] = payload["usageDebug"]
 
             chat_url = payload.get("chatUrl")
-            if chat_url and payload.get("messages") is not None:
+            new_messages = payload.get("messages")
+            if chat_url and isinstance(new_messages, list):
                 existing = account["chats"].get(chat_url, {})
+                if not new_messages and existing.get("messages"):
+                    # یه چت که قبلاً پیام داشته نمیتونه یهو صفر پیام بشه؛ یعنی گزارش ناقص بوده. تاریخچه رو نگه دار.
+                    new_messages = existing["messages"]
                 account["chats"][chat_url] = {
                     "title": payload.get("chatTitle"),
-                    "messages": payload["messages"],
+                    "messages": new_messages,
                     "lastUpdated": now,
                     "notes": existing.get("notes", []),  # یادداشت‌های کلیِ قبلی حفظ میشن
                     "messageNotes": existing.get("messageNotes", {}),  # یادداشت‌های تک‌پیامیِ قبلی حفظ میشن
