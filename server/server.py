@@ -7,6 +7,7 @@
 
 import json
 import os
+import re
 import html as htmllib
 import http.server
 import socketserver
@@ -59,6 +60,36 @@ def merge_usage(old, new):
             continue
         merged[k] = v
     return merged
+
+
+DEFAULT_LABEL = "بدون‌نام"
+# کاراکترهایی که اگه داخل برچسب اکانت یا آدرس چت باشن میتونن از داخل attribute/رشته‌ی JS صفحه‌ی داشبورد
+# بیرون بزنن (کلید چت توی onclick="...'کلید'..." و innerHTML کلاینت استفاده میشه). همون ورودی پاک میشه.
+_UNSAFE_CHARS_RE = re.compile("[\\x00-\\x1f\\x7f\\u2028\\u2029\"'`<>&\\\\]")
+
+
+def clean_label(raw):
+    if not isinstance(raw, str):
+        return DEFAULT_LABEL
+    s = _UNSAFE_CHARS_RE.sub("", raw)
+    s = re.sub(r":{2,}", ":", s)  # "::" جداکننده‌ی کلید چت (label::url) هست
+    s = " ".join(s.split())[:60]
+    return s or DEFAULT_LABEL
+
+
+def clean_chat_url(raw):
+    """فقط آدرس چت‌های https://claude.ai/... قبول میشه، بدون query و fragment. چیز دیگه‌ای None برمی‌گرده."""
+    if not isinstance(raw, str) or len(raw) > 500:
+        return None
+    try:
+        u = urlparse(raw.strip())
+    except ValueError:
+        return None
+    if u.scheme != "https" or u.netloc.lower() != "claude.ai":
+        return None
+    if not re.fullmatch(r"/[A-Za-z0-9/_.~%-]*", u.path):
+        return None
+    return "https://claude.ai" + u.path
 
 
 def esc(s):
@@ -1554,7 +1585,7 @@ def render_dashboard(db):
     # قرار بگیره، مرورگر تگ اسکریپت رو همون‌جا "می‌بنده"، بقیه‌ی جیسون به‌صورت متن خام روی صفحه ریخته
     # می‌شه و همه‌ی دکمه‌ها از کار می‌افتن (چون کد جاوااسکریپت بعدش اصلاً اجرا نمی‌شه).
     # با جایگزینی "</" با "<\/" (که توی JSON کاملاً معتبره) از این مشکل جلوگیری می‌کنیم.
-    chat_data_json = json.dumps(build_chat_data_json(db), ensure_ascii=False).replace("</", "<\\/")
+    chat_data_json = json.dumps(build_chat_data_json(db), ensure_ascii=False).replace("</", "<\\/").replace("<!--", "\\u003c!--")
 
     return PAGE.format(
         count=len(db),
@@ -1567,24 +1598,65 @@ def render_dashboard(db):
     )
 
 
+# فقط خودِ داشبورد و اکستنشن حق دارن با این سرور حرف بزنن. قبلاً Access-Control-Allow-Origin: * بود،
+# یعنی هر سایتی که توی مرورگر باز میشد میتونست /export/all (کل تاریخچه‌ی چت‌ها) رو بخونه یا /report بفرسته.
+ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}"}  # جلوگیری از DNS rebinding
+ALLOWED_ORIGINS = {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
+MAX_BODY_BYTES = 50 * 1024 * 1024
+
+
+def origin_allowed(origin):
+    return origin in ALLOWED_ORIGINS or (isinstance(origin, str) and origin.startswith("chrome-extension://"))
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        """هدرهای CORS (فقط برای مبدأهای مجاز) + چند هدر امنیتی ساده."""
+        origin = self.headers.get("Origin")
+        if origin and origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+
+    def _allowed(self):
+        host = (self.headers.get("Host") or "").lower()
+        if host not in ALLOWED_HOSTS:
+            return False
+        origin = self.headers.get("Origin")  # بدون Origin = باز کردن مستقیم تو مرورگر، curl، یا درخواست هم‌مبدأ
+        return origin is None or origin_allowed(origin)
+
+    def _reject(self):
+        body = b"forbidden"
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if not self._allowed():
+            self._reject()
+            return
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def _read_json(self):
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return None
+        if length < 0 or length > MAX_BODY_BYTES:
+            return None
         body = self.rfile.read(length)
         try:
-            return json.loads(body)
-        except json.JSONDecodeError:
+            data = json.loads(body)
+        except ValueError:  # JSONDecodeError و UnicodeDecodeError
             return None
+        return data if isinstance(data, dict) else None
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1595,6 +1667,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if not self._allowed():
+            self._reject()
+            return
         path = urlparse(self.path).path
 
         if path == "/report":
@@ -1603,7 +1678,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"error": "bad json"}, 400)
                 return
 
-            label = payload.get("accountLabel", "بدون‌نام")
+            label = clean_label(payload.get("accountLabel"))
             now = payload.get("checkedAt") or datetime.now(timezone.utc).isoformat()
 
             db = load_db()
@@ -1614,7 +1689,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if payload.get("usageDebug"):
                 account["usageDebug"] = payload["usageDebug"]
 
-            chat_url = payload.get("chatUrl")
+            chat_url = clean_chat_url(payload.get("chatUrl"))
             new_messages = payload.get("messages")
             if chat_url and isinstance(new_messages, list):
                 existing = account["chats"].get(chat_url, {})
@@ -1666,6 +1741,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             label = payload.get("accountLabel")
             chat_url = payload.get("chatUrl")
             parent_key = payload.get("parentKey")
+            if parent_key is not None and not isinstance(parent_key, str):
+                self._send_json({"error": "bad parentKey"}, 400)
+                return
 
             db = load_db()
             account = db.get(label)
@@ -1677,6 +1755,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             my_key = make_chat_key(label, chat_url)
 
             if parent_key:
+                pk_label, _, pk_url = parent_key.partition("::")
+                if pk_url not in ((db.get(pk_label) or {}).get("chats") or {}):
+                    self._send_json({"error": "parent chat not found"}, 404)
+                    return
                 # از حلقه شدن زنجیره جلوگیری کن (چت نباید خودش یا نوه‌ی خودش رو والد خودش بکنه)
                 seen = set()
                 cur = parent_key
@@ -1816,6 +1898,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if not self._allowed():
+            self._reject()
+            return
         if self.path in ("/", "/dashboard"):
             db = load_db()
             body = render_dashboard(db).encode("utf-8")
